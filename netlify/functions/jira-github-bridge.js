@@ -32,13 +32,23 @@ exports.handler = async (event) => {
 
   console.warn('[jira-github-bridge] INFO: event.body: ', event);
 
+  const rawBody = event.isBase64Encoded
+    ? Buffer.from(event.body, 'base64').toString('utf-8')
+    : event.body;
+
+  console.log('[jira-github-bridge] rawBody:', rawBody);
+
   let payload;
   try {
-    payload = JSON.parse(event.body);
+    payload = JSON.parse(rawBody);
   } catch {
-    console.error('[jira-github-bridge] Rejected: invalid JSON body');
-    return { statusCode: 400, body: 'Invalid JSON' };
+    // Fallback: Automation for Jira sends the issue description as plain wiki markup text.
+    // Treat every such request as a bug report — the automation rule already scopes the trigger.
+    console.log('[jira-github-bridge] Body is not JSON, attempting wiki markup parse');
+    return handleWikiMarkupBody(rawBody);
   }
+
+  console.log('[jira-github-bridge] payload:', JSON.stringify(payload, null, 2));
 
   const eventType = payload.webhookEvent;
   console.log('[jira-github-bridge] Jira event received:', eventType);
@@ -369,8 +379,7 @@ function parseDescriptionSections(adfNode) {
   if (!adfNode) return result;
 
   if (typeof adfNode === 'string') {
-    result.description = adfNode;
-    return result;
+    return parseWikiMarkupSections(adfNode);
   }
 
   if (adfNode.type !== 'doc') return result;
@@ -452,4 +461,111 @@ function extractListItemText(node) {
     .map(n => (n.type === 'paragraph' ? (n.content ?? []).map(extractNodeText).join('') : extractNodeText(n)))
     .join('')
     .trimEnd();
+}
+
+// ---------- Wiki markup (plain-text) handling ----------
+
+/**
+ * Splits Jira wiki markup text on [tag] section markers and returns named sections.
+ * Used when Automation for Jira sends the issue description directly as the request body.
+ */
+function parseWikiMarkupSections(text) {
+  const result = { description: '', steps: '', expected: '', actual: '', extra: '' };
+  if (!text) return result;
+
+  const sectionRegex = /\[([a-z0-9_-]+)\][^\n]*/gi;
+  const matches = [];
+  let m;
+  while ((m = sectionRegex.exec(text)) !== null) {
+    matches.push({ tag: m[1].toLowerCase(), index: m.index, fullLen: m[0].length });
+  }
+
+  if (matches.length === 0) {
+    result.description = cleanWikiMarkup(text.trim());
+    return result;
+  }
+
+  for (let i = 0; i < matches.length; i++) {
+    const { tag, index, fullLen } = matches[i];
+    const contentStart = index + fullLen;
+    const contentEnd   = i + 1 < matches.length ? matches[i + 1].index : text.length;
+    const content      = text.slice(contentStart, contentEnd).trim();
+
+    let key = null;
+    for (const [k, { tags }] of Object.entries(SECTION_MATCHERS)) {
+      if (tags.includes(tag)) { key = k; break; }
+    }
+    if (key && key in result) result[key] = cleanWikiMarkup(content);
+  }
+
+  return result;
+}
+
+function cleanWikiMarkup(text) {
+  return text
+    .split('\n')
+    .map(line =>
+      line
+        .replace(/^# /,             '1. ')                           // ordered list
+        .replace(/^h([1-6])\. /,    (_, n) => '#'.repeat(+n) + ' ') // headings
+    )
+    .join('\n')
+    .replace(/!([^|!\n]+?)(?:\|[^!\n]*)?!/g, '_[image: $1]_')       // !img.png|opts!
+    .trim();
+}
+
+async function handleWikiMarkupBody(rawText) {
+  const sections = parseWikiMarkupSections(rawText);
+  console.log('[jira-github-bridge] Parsed wiki markup sections:', sections);
+
+  const titleLine = (sections.description || '').split('\n').find(l => l.trim()) ?? '';
+  const title     = titleLine.slice(0, 80) || 'Bug Report from Jira';
+
+  const devMentions = (DEVELOPER_TEAM ?? '')
+    .split(',')
+    .map(u => `@${u.trim()}`)
+    .filter(Boolean)
+    .join(', ');
+
+  const issueBody = `## Bug Report from JIRA
+
+### Description
+${sections.description || '_No description provided_'}
+${sections.steps    ? `\n### Steps to Reproduce\n${sections.steps}\n`   : ''}
+${sections.expected ? `\n### Expected Result\n${sections.expected}\n`   : ''}
+${sections.actual   ? `\n### Actual Result\n${sections.actual}\n`       : ''}
+${sections.extra    ? `\n### Extra Info\n${sections.extra}\n`           : ''}
+---
+
+@claude Please verify whether this bug exists in the current codebase.
+
+**Instructions for Claude — pick exactly one of the three outcomes:**
+
+**Outcome A — Bug confirmed in code:**
+- Run: \`gh issue edit $ISSUE_NUMBER --add-label "confirmed-bug" --add-label "jules" --remove-label "needs-verification"\`
+- Comment: summarize where in the code the bug lives and confirm Jules has been assigned to fix it.
+
+**Outcome B — Bug rejected (does not exist or already fixed):**
+- Run: \`gh issue edit $ISSUE_NUMBER --add-label "invalid" --remove-label "needs-verification"\`
+- Comment: explain the finding (already fixed, behaviour is intentional, etc.).
+
+**Outcome C — Cannot verify without emulator/device (visual rendering, platform-specific crash, runtime-only behaviour):**
+- Run: \`gh issue edit $ISSUE_NUMBER --add-label "hard-reproduce" --remove-label "needs-verification"\`
+- If the bug is visual/UI: also run \`gh issue edit $ISSUE_NUMBER --add-label "visual"\`
+- Comment tagging the team: "${devMentions} — this bug requires device or emulator testing to verify. Please reproduce manually and update the label to \`confirmed-bug\` or \`invalid\`."
+
+(Replace \`$ISSUE_NUMBER\` above with the actual number of this GitHub issue.)
+
+**Instructions for Jules (if assigned via Outcome A):**
+- Fix the bug described above.
+- Create a regression test at \`regression-tests/<issue-slug>.test.ts\` — skip ONLY for pure visual/UI bugs with no testable logic.
+- Reference \`closes #$ISSUE_NUMBER\` in your PR description.`;
+
+  return postGitHubIssue({
+    title,
+    body:    issueBody,
+    labels:  ['bug', 'from-jira', 'needs-verification'],
+    jiraKey: 'JIRA',
+    routeTag: 'wiki-markup',
+  });
 }
