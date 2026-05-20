@@ -3,15 +3,19 @@ const GITHUB_TOKEN        = process.env.GITHUB_BRIDGE_TOKEN;
 const GITHUB_REPO         = process.env.GITHUB_REPO;           // e.g. "jyggiz/react-native-starter"
 const DEVELOPER_TEAM      = process.env.DEVELOPER_TEAM;        // e.g. "jyggiz,dev2,dev3"
 const JIRA_BASE_URL       = process.env.JIRA_BASE_URL;         // e.g. "https://yourcompany.atlassian.net"
+const JIRA_EMAIL          = process.env.JIRA_EMAIL;            // e.g. "you@company.com"
+const JIRA_API_TOKEN      = process.env.JIRA_API_TOKEN;        // Jira API token (not password)
 
 exports.handler = async (event) => {
   console.log('[jira-github-bridge] Function triggered');
   console.log('[jira-github-bridge] Env vars present:', {
     JIRA_WEBHOOK_SECRET: !!JIRA_WEBHOOK_SECRET,
     GITHUB_BRIDGE_TOKEN: !!GITHUB_TOKEN,
-    GITHUB_REPO:         GITHUB_REPO         ?? '(not set)',
-    DEVELOPER_TEAM:      DEVELOPER_TEAM      ?? '(not set)',
-    JIRA_BASE_URL:       JIRA_BASE_URL        ?? '(not set)',
+    GITHUB_REPO:         GITHUB_REPO    ?? '(not set)',
+    DEVELOPER_TEAM:      DEVELOPER_TEAM ?? '(not set)',
+    JIRA_BASE_URL:       JIRA_BASE_URL  ?? '(not set)',
+    JIRA_EMAIL:          !!JIRA_EMAIL,
+    JIRA_API_TOKEN:      !!JIRA_API_TOKEN,
   });
 
   if (event.httpMethod !== 'POST') {
@@ -80,6 +84,7 @@ async function handleBugCreated({ key, fields }) {
   const reporter = fields.reporter?.displayName ?? 'Unknown';
 
   const { description, steps, expected, actual, extra } = parseDescriptionSections(fields.description);
+  const attachmentsSection = await buildAttachmentsSection(fields.attachment, key);
 
   const devMentions = (DEVELOPER_TEAM ?? '')
     .split(',')
@@ -105,6 +110,7 @@ ${expected || '_Not specified_'}
 ### Actual Result
 ${actual || '_Not specified_'}
 ${extra ? `\n### Extra Info\n${extra}\n` : ''}
+${attachmentsSection}
 ---
 
 @claude Please verify whether this bug exists in the current codebase.
@@ -147,6 +153,7 @@ async function handleMobileLabelAdded({ key, fields }) {
   const issueType = fields.issuetype?.name ?? 'Unknown';
 
   const { description, steps, expected, actual, extra } = parseDescriptionSections(fields.description);
+  const attachmentsSection = await buildAttachmentsSection(fields.attachment, key);
 
   const devMentions = (DEVELOPER_TEAM ?? '')
     .split(',')
@@ -167,6 +174,7 @@ ${steps   ? `\n### Steps to Reproduce\n${steps}\n`   : ''}
 ${expected ? `\n### Expected Result\n${expected}\n`   : ''}
 ${actual   ? `\n### Actual Result\n${actual}\n`       : ''}
 ${extra    ? `\n### Extra Info\n${extra}\n`           : ''}
+${attachmentsSection}
 ---
 
 This issue was labeled **mobile** in JIRA and requires mobile-specific attention.
@@ -208,6 +216,89 @@ async function postGitHubIssue({ title, body, labels, jiraKey, routeTag }) {
   const created = await response.json();
   console.log(`[jira-github-bridge] [${routeTag}] GitHub issue #${created.number} created for ${jiraKey}`);
   return { statusCode: 200, body: JSON.stringify({ github_issue: created.number }) };
+}
+
+// ---------- Attachment handling ----------
+
+const IMAGE_SIZE_LIMIT = 10 * 1024 * 1024; // 10 MB — GitHub's upload cap
+
+/**
+ * For each image attachment, attempts to download from Jira and re-upload to GitHub
+ * so the image renders inline without requiring Jira access.
+ * Falls back to a plain Jira link when credentials are missing or either request fails.
+ */
+async function buildAttachmentsSection(attachments, jiraKey) {
+  const images = (attachments ?? []).filter(
+    a => a.mimeType?.startsWith('image/') && (a.size ?? 0) <= IMAGE_SIZE_LIMIT
+  );
+
+  if (images.length === 0) return '';
+
+  console.log(`[jira-github-bridge] [${jiraKey}] Found ${images.length} image attachment(s)`);
+
+  const lines = await Promise.all(
+    images.map(async (img) => {
+      const githubUrl = await uploadAttachmentToGitHub(img, jiraKey);
+      if (githubUrl) return `![${img.filename}](${githubUrl})`;
+      return `- [${img.filename}](${img.content})`;
+    })
+  );
+
+  return `### Attachments\n${lines.join('\n')}\n`;
+}
+
+async function uploadAttachmentToGitHub(attachment, jiraKey) {
+  if (!JIRA_EMAIL || !JIRA_API_TOKEN) {
+    console.warn(`[jira-github-bridge] [${jiraKey}] JIRA_EMAIL / JIRA_API_TOKEN not set — skipping image download for ${attachment.filename}`);
+    return null;
+  }
+
+  // Download from Jira
+  let imageBuffer;
+  try {
+    const jiraAuth = Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString('base64');
+    const dl = await fetch(attachment.content, {
+      headers: { Authorization: `Basic ${jiraAuth}` },
+    });
+    if (!dl.ok) {
+      console.error(`[jira-github-bridge] [${jiraKey}] Jira attachment download failed (${dl.status}) for ${attachment.filename}`);
+      return null;
+    }
+    imageBuffer = await dl.arrayBuffer();
+    console.log(`[jira-github-bridge] [${jiraKey}] Downloaded ${attachment.filename} (${imageBuffer.byteLength} bytes)`);
+  } catch (err) {
+    console.error(`[jira-github-bridge] [${jiraKey}] Jira download error for ${attachment.filename}:`, err);
+    return null;
+  }
+
+  // Upload to GitHub's asset host
+  try {
+    const up = await fetch(
+      `https://uploads.github.com/repos/${GITHUB_REPO}/issues/assets?name=${encodeURIComponent(attachment.filename)}`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization:        `Bearer ${GITHUB_TOKEN}`,
+          Accept:               'application/vnd.github+json',
+          'Content-Type':       attachment.mimeType,
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+        body: imageBuffer,
+      }
+    );
+    if (!up.ok) {
+      const text = await up.text();
+      console.error(`[jira-github-bridge] [${jiraKey}] GitHub asset upload failed (${up.status}) for ${attachment.filename}:`, text);
+      return null;
+    }
+    const data = await up.json();
+    const url  = data.url ?? data.content_url ?? null;
+    console.log(`[jira-github-bridge] [${jiraKey}] Uploaded ${attachment.filename} → ${url}`);
+    return url;
+  } catch (err) {
+    console.error(`[jira-github-bridge] [${jiraKey}] GitHub upload error for ${attachment.filename}:`, err);
+    return null;
+  }
 }
 
 // ---------- Description section parsing ----------
