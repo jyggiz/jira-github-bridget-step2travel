@@ -220,6 +220,7 @@ async function postGitHubIssue({ title, body, labels, jiraKey, routeTag }) {
 
 // ---------- Attachment handling ----------
 
+const ENABLE_IMAGE_ATTACHMENTS = false; // set to true to re-enable
 const IMAGE_SIZE_LIMIT = 10 * 1024 * 1024; // 10 MB — GitHub's upload cap
 
 /**
@@ -228,6 +229,8 @@ const IMAGE_SIZE_LIMIT = 10 * 1024 * 1024; // 10 MB — GitHub's upload cap
  * Falls back to a plain Jira link when credentials are missing or either request fails.
  */
 async function buildAttachmentsSection(attachments, jiraKey) {
+  if (!ENABLE_IMAGE_ATTACHMENTS) return '';
+
   const images = (attachments ?? []).filter(
     a => a.mimeType?.startsWith('image/') && (a.size ?? 0) <= IMAGE_SIZE_LIMIT
   );
