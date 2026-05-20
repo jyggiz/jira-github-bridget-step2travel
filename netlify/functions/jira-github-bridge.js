@@ -1,7 +1,6 @@
 const JIRA_WEBHOOK_SECRET = process.env.JIRA_WEBHOOK_SECRET;
 const GITHUB_TOKEN        = process.env.GITHUB_BRIDGE_TOKEN;
 const GITHUB_REPO         = process.env.GITHUB_REPO;           // e.g. "jyggiz/react-native-starter"
-const JULES_USERNAME      = process.env.JULES_GITHUB_USERNAME; // e.g. "jules-google-labs[bot]"
 const DEVELOPER_TEAM      = process.env.DEVELOPER_TEAM;        // e.g. "jyggiz,dev2,dev3"
 const JIRA_BASE_URL       = process.env.JIRA_BASE_URL;         // e.g. "https://yourcompany.atlassian.net"
 
@@ -75,8 +74,7 @@ ${actual || '_Not specified_'}
 **Instructions for Claude — pick exactly one of the three outcomes:**
 
 **Outcome A — Bug confirmed in code:**
-- Run: \`gh issue edit $ISSUE_NUMBER --add-label "confirmed-bug" --remove-label "needs-verification"\`
-- Run: \`gh issue edit $ISSUE_NUMBER --add-assignee ${JULES_USERNAME}\`
+- Run: \`gh issue edit $ISSUE_NUMBER --add-label "confirmed-bug" --add-label "jules" --remove-label "needs-verification"\`
 - Comment: summarize where in the code the bug lives and confirm Jules has been assigned to fix it.
 
 **Outcome B — Bug rejected (does not exist or already fixed):**
