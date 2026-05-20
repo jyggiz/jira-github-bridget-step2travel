@@ -79,10 +79,7 @@ async function handleBugCreated({ key, fields }) {
   const priority = fields.priority?.name ?? 'Unknown';
   const reporter = fields.reporter?.displayName ?? 'Unknown';
 
-  const description = extractText(fields.description);
-  const steps       = extractText(fields.customfield_10026); // adjust field ID for your JIRA
-  const expected    = extractText(fields.customfield_10027); // adjust field ID for your JIRA
-  const actual      = extractText(fields.customfield_10028); // adjust field ID for your JIRA
+  const { description, steps, expected, actual, extra } = parseDescriptionSections(fields.description);
 
   const devMentions = (DEVELOPER_TEAM ?? '')
     .split(',')
@@ -102,12 +99,12 @@ ${description || '_No description provided_'}
 ### Steps to Reproduce
 ${steps || '_Not specified_'}
 
-### Expected Behavior
+### Expected Result
 ${expected || '_Not specified_'}
 
-### Actual Behavior
+### Actual Result
 ${actual || '_Not specified_'}
-
+${extra ? `\n### Extra Info\n${extra}\n` : ''}
 ---
 
 @claude Please verify whether this bug exists in the current codebase.
@@ -144,12 +141,12 @@ ${actual || '_Not specified_'}
 }
 
 async function handleMobileLabelAdded({ key, fields }) {
-  const summary  = fields.summary ?? '';
-  const priority = fields.priority?.name ?? 'Unknown';
-  const reporter = fields.reporter?.displayName ?? 'Unknown';
+  const summary   = fields.summary ?? '';
+  const priority  = fields.priority?.name ?? 'Unknown';
+  const reporter  = fields.reporter?.displayName ?? 'Unknown';
   const issueType = fields.issuetype?.name ?? 'Unknown';
 
-  const description = extractText(fields.description);
+  const { description, steps, expected, actual, extra } = parseDescriptionSections(fields.description);
 
   const devMentions = (DEVELOPER_TEAM ?? '')
     .split(',')
@@ -166,7 +163,10 @@ async function handleMobileLabelAdded({ key, fields }) {
 
 ### Description
 ${description || '_No description provided_'}
-
+${steps   ? `\n### Steps to Reproduce\n${steps}\n`   : ''}
+${expected ? `\n### Expected Result\n${expected}\n`   : ''}
+${actual   ? `\n### Actual Result\n${actual}\n`       : ''}
+${extra    ? `\n### Extra Info\n${extra}\n`           : ''}
 ---
 
 This issue was labeled **mobile** in JIRA and requires mobile-specific attention.
@@ -210,16 +210,152 @@ async function postGitHubIssue({ title, body, labels, jiraKey, routeTag }) {
   return { statusCode: 200, body: JSON.stringify({ github_issue: created.number }) };
 }
 
+// ---------- Description section parsing ----------
+
+// Recognised section keys with their optional [tag] prefixes and fallback heading texts.
+// Tip: add a [tag] at the start of headings in your Jira template (e.g. "[steps] Steps to reproduce")
+// to make matching unambiguous regardless of the surrounding heading text.
+const SECTION_MATCHERS = {
+  description: {
+    tags:  ['description', 'desc'],
+    texts: ['description'],
+  },
+  steps: {
+    tags:  ['steps', 'reproduce'],
+    texts: ['steps to reproduce', 'steps'],
+  },
+  expected: {
+    tags:  ['expected'],
+    texts: ['expected result', 'expected behavior', 'expected behaviour', 'expected'],
+  },
+  actual: {
+    tags:  ['actual'],
+    texts: ['actual result', 'actual behavior', 'actual behaviour', 'actual'],
+  },
+  extra: {
+    tags:  ['extra', 'info', 'additional'],
+    texts: ['extra info', 'additional info', 'additional information', 'notes'],
+  },
+};
+
 /**
- * Recursively extracts plain text from Atlassian Document Format (ADF) nodes.
- * Falls back gracefully if the value is already a plain string.
+ * Maps a heading's plain-text to a section key.
+ * Tries [tag] prefix first, then normalized text match.
  */
-function extractText(node) {
+function identifySection(headingText) {
+  const normalized = headingText.trim().toLowerCase();
+
+  const tagMatch = normalized.match(/^\[([a-z0-9_-]+)\]/);
+  if (tagMatch) {
+    const tag = tagMatch[1];
+    for (const [key, { tags }] of Object.entries(SECTION_MATCHERS)) {
+      if (tags.includes(tag)) return key;
+    }
+  }
+
+  for (const [key, { texts }] of Object.entries(SECTION_MATCHERS)) {
+    if (texts.some(t => normalized === t || normalized.startsWith(t + ' ') || normalized.startsWith(t + ':'))) {
+      return key;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Splits an Atlassian Document Format (ADF) doc node into named sections
+ * by walking top-level nodes and bucketing content between headings.
+ * Falls back gracefully when the value is a plain string (older Jira instances).
+ *
+ * Returns: { description, steps, expected, actual, extra }
+ */
+function parseDescriptionSections(adfNode) {
+  const result = { description: '', steps: '', expected: '', actual: '', extra: '' };
+
+  if (!adfNode) return result;
+
+  if (typeof adfNode === 'string') {
+    result.description = adfNode;
+    return result;
+  }
+
+  if (adfNode.type !== 'doc') return result;
+
+  const sections = new Map();
+  let currentKey   = null;
+  let currentNodes = [];
+
+  for (const node of (adfNode.content ?? [])) {
+    if (node.type === 'heading') {
+      if (currentKey !== null) sections.set(currentKey, currentNodes);
+      currentKey   = identifySection(extractNodeText(node));
+      currentNodes = [];
+    } else if (currentKey !== null) {
+      currentNodes.push(node);
+    }
+  }
+  if (currentKey !== null) sections.set(currentKey, currentNodes);
+
+  for (const [key, nodes] of sections) {
+    if (key in result) result[key] = extractNodesText(nodes).trim();
+  }
+
+  return result;
+}
+
+function extractNodesText(nodes) {
+  return nodes.map(extractNodeText).join('\n');
+}
+
+/**
+ * Recursively converts a single ADF node to readable plain text.
+ * Handles paragraphs, ordered/bullet lists, code blocks, and inline text.
+ */
+function extractNodeText(node) {
   if (!node) return '';
   if (typeof node === 'string') return node;
-  if (node.type === 'text') return node.text ?? '';
-  if (Array.isArray(node.content)) {
-    return node.content.map(extractText).join('');
+
+  switch (node.type) {
+    case 'text':
+      return node.text ?? '';
+
+    case 'hardBreak':
+      return '\n';
+
+    case 'paragraph':
+      return (node.content ?? []).map(extractNodeText).join('') + '\n';
+
+    case 'heading':
+      return (node.content ?? []).map(extractNodeText).join('');
+
+    case 'orderedList':
+      return (node.content ?? [])
+        .map((item, i) => `${i + 1}. ${extractListItemText(item)}`)
+        .join('\n') + '\n';
+
+    case 'bulletList':
+      return (node.content ?? [])
+        .map(item => `- ${extractListItemText(item)}`)
+        .join('\n') + '\n';
+
+    case 'codeBlock':
+      return '```\n' + (node.content ?? []).map(extractNodeText).join('') + '\n```\n';
+
+    case 'blockquote':
+      return (node.content ?? [])
+        .map(n => '> ' + extractNodeText(n))
+        .join('');
+
+    default:
+      if (Array.isArray(node.content)) return node.content.map(extractNodeText).join('');
+      return '';
   }
-  return '';
+}
+
+function extractListItemText(node) {
+  if (!node || node.type !== 'listItem') return '';
+  return (node.content ?? [])
+    .map(n => (n.type === 'paragraph' ? (n.content ?? []).map(extractNodeText).join('') : extractNodeText(n)))
+    .join('')
+    .trimEnd();
 }
