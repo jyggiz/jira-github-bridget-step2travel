@@ -26,6 +26,8 @@ exports.handler = async (event) => {
     return { statusCode: 401, body: 'Unauthorized' };
   }
 
+  console.warn('[jira-github-bridge] INFO: event.body: ', event.body);
+
   let payload;
   try {
     payload = JSON.parse(event.body);
