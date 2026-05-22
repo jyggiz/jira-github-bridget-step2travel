@@ -230,7 +230,7 @@ async function postGitHubIssue({ title, body, labels, jiraKey, routeTag }) {
 
 // ---------- Attachment handling ----------
 
-const ENABLE_IMAGE_ATTACHMENTS = false; // set to true to re-enable
+const ENABLE_IMAGE_ATTACHMENTS = true;
 const IMAGE_SIZE_LIMIT = 10 * 1024 * 1024; // 10 MB — GitHub's upload cap
 
 /**
